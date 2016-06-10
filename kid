@@ -16,10 +16,13 @@ Usage: kid [command]
 
 Available commands:
   up       Starts Kubernetes in the Docker host currently configured with your local docker command
-  down     Tear down a previously started Kubernetes cluster
+  down     Tear down a previously started Kubernetes cluster leaving Deployments and Replica Sets intact
   restart  Restart Kubernetes
+  purge    Removes all Deployments, Replica Sets, Replication Controllers, Services, Pods, and Namespaces
 EOF
 }
+
+
 
 function check_prerequisites {
     function require_command_exists() {
@@ -63,6 +66,26 @@ function wait_for_kubernetes {
     until $(kubectl cluster-info &> /dev/null); do
         sleep 1
     done
+}
+
+function check_for_kubernetes {
+    result=$(kubectl cluster-info &> /dev/null)
+    if [ -z "$result" ];
+    then
+      return 0
+    else
+      return 1
+    fi
+}
+
+function check_for_docker_containers {
+    result=$(docker ps -aq &> /dev/null)
+    if [ -z $result ];
+    then
+      return 0
+    else
+      return 1
+    fi
 }
 
 function create_kube_system_namespace {
@@ -178,18 +201,27 @@ function start_kubernetes {
 
     echo Waiting for Kubernetes cluster to become available...
     wait_for_kubernetes
+    sleep 1
     create_kube_system_namespace
     activate_kubernetes_dashboard $dashboard_service_nodeport
     echo Kubernetes cluster is up. The Kubernetes dashboard can be accessed via HTTP at port $dashboard_service_nodeport of your Docker host.
 }
 
 function delete_kubernetes_resources {
+    kubectl delete namespace kube-system > /dev/null 2>&1 || :
     kubectl delete replicationcontrollers,services,pods,secrets --all > /dev/null 2>&1 || :
     kubectl delete replicationcontrollers,services,pods,secrets --all --namespace=kube-system > /dev/null 2>&1 || :
     kubectl delete namespace kube-system > /dev/null 2>&1 || :
 }
 
-function delete_docker_containers {
+function purge_kubernetes_resources {
+    kubectl delete namespace kube-system > /dev/null 2>&1 || :
+    kubectl delete deployments,replicasets,replicationcontrollers,services,pods,secrets --all > /dev/null 2>&1 || :
+    kubectl delete deployments,replicasets,replicationcontrollers,services,pods,secrets --all --namespace=kube-system > /dev/null 2>&1 || :
+    kubectl delete namespace kube-system > /dev/null 2>&1 || :
+}
+
+function delete_kubelet_containers {
     # Remove the kubelet first so that it doesn't restart pods that we're going to remove next
     docker stop k8s_kubelet > /dev/null 2>&1
     docker rm -fv k8s_kubelet > /dev/null 2>&1
@@ -202,12 +234,37 @@ function delete_docker_containers {
     fi
 }
 
+function delete_docker_containers {
+
+    docker_containers=$(docker ps -aq)
+
+    if [ ! -z "$docker_containers" ]; then
+        while [ ! -z "$docker_containers" ]; do
+	   docker stop $(docker ps -aq) > /dev/null 2>&1 || :
+           docker wait $(docker ps -aq) || :
+           docker rm -fv $(docker ps -aq) > /dev/null 2>&1 || :
+           docker_containers=$(docker ps -aq) || :
+        done
+    fi
+}
+
+function purge_kubernetes {
+  local kubernetes_api_port=$1
+  purge_kubernetes_resources
+  delete_kubelet_containers
+  delete_docker_containers
+  remove_port_forward_if_forwarded $kubernetes_api_port
+}
+
 function stop_kubernetes {
     local kubernetes_api_port=$1
     delete_kubernetes_resources
-    delete_docker_containers
+    delete_kubelet_containers
     remove_port_forward_if_forwarded $kubernetes_api_port
+    delete_docker_containers
 }
+
+
 
 if [ "$1" == "up" ]; then
     start_kubernetes $KUBERNETES_VERSION $KUBERNETES_API_PORT $KUBERNETES_DASHBOARD_NODEPORT
@@ -217,6 +274,13 @@ elif [ "$1" == "down" ]; then
 elif [ "$1" == "restart" ]; then
     # TODO: Check if not currently running before downing. Show a message if not running.
     kid down && kid up
+elif [ "$1" == "purge" ]; then
+    purge_kubernetes
+elif [ "$1" == "systemd" ]; then
+    #used only for systemd to restart pods automatically on hard reboot. Kill most everything except etcd to maintain persistance.
+      if [ check_for_docker_containers ];then 
+         delete_docker_containers
+      fi
 else
     print_usage
 fi
