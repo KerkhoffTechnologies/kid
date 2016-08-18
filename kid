@@ -5,6 +5,11 @@
 KUBERNETES_VERSION=1.2.4
 KUBERNETES_API_PORT=8080
 KUBERNETES_DASHBOARD_NODEPORT=31999
+KUBERNETES_DNS_IP=10.0.0.10
+KUBERNETES_DNS_DOMAIN=cluster.local
+DNS_HOST_ENDPOINT=$(echo $DOCKER_HOST | awk -F'[/:]' '{print $4}')
+: ${DNS_HOST_ENDPOINT:=$(ifconfig docker0 | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*')}
+#DNS_HOST_ENDPOINT=172.17.0.1
 
 set -e
 
@@ -99,6 +104,100 @@ metadata:
 EOF
 }
 
+function activate_kubernetes_dns {
+    local dns_ip=$1
+    local dns_domain=$2
+    local dns_endpoint=$3
+
+    kubectl create -f - << EOF > /dev/null
+kind: List
+apiVersion: v1
+items:
+- kind: ReplicationController
+  apiVersion: v1
+  metadata:
+    name: kube-dns-v11
+    namespace: kube-system
+    labels:
+      k8s-app: kube-dns
+      version: v11
+      kubernetes.io/cluster-service: "true"
+  spec:
+    replicas: 1
+    selector:
+      k8s-app: kube-dns
+      version: v11
+    template:
+      metadata:
+        labels:
+          k8s-app: kube-dns
+          version: v11
+          kubernetes.io/cluster-service: "true"
+      spec:
+        hostNetwork: true
+        containers:
+        - name: kube2sky
+          image: gcr.io/google_containers/kube2sky:1.14
+          resources:
+            limits:
+              cpu: 100m
+              # Kube2sky watches all pods.
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 50Mi
+          args:
+          # command = "/kube2sky"
+          - --domain=${dns_domain}
+        - name: skydns
+          image: gcr.io/google_containers/skydns:2015-10-13-8c72f8c
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 50Mi
+          args:
+          # command = "/skydns"
+          - -machines=http://127.0.0.1:4001
+          - -addr=0.0.0.0:53
+          - -ns-rotate=false
+          - -domain=${dns_domain}
+          ports:
+          - containerPort: 53
+            name: dns
+            protocol: UDP
+          - containerPort: 53
+            name: dns-tcp
+            protocol: TCP
+        dnsPolicy: Default  # Don't use cluster DNS.
+- kind: Endpoints
+  apiVersion: v1
+  metadata:
+    name: kube-dns
+    namespace: kube-system
+  subsets:
+  - addresses:
+    - ip: ${dns_endpoint}
+    ports:
+    - port: 53
+      protocol: UDP
+      name: dns
+- kind: Service
+  apiVersion: v1
+  metadata:
+    name: kube-dns
+    namespace: kube-system
+  spec:
+    clusterIP: 10.0.0.10
+    ports:
+    - name: dns
+      port: 53
+      protocol: UDP
+EOF
+}
+
 function activate_kubernetes_dashboard {
     local dashboard_service_nodeport=$1
     kubectl create -f - << EOF > /dev/null
@@ -166,6 +265,10 @@ function start_kubernetes {
     local kubernetes_version=$1
     local kubernetes_api_port=$2
     local dashboard_service_nodeport=$3
+    local dns_ip=$4
+    local dns_domain=$5
+    local dns_endpoint=$6
+
     check_prerequisites
 
     if kubectl cluster-info 2> /dev/null; then
@@ -191,8 +294,8 @@ function start_kubernetes {
             --address="0.0.0.0" \
             --api-servers=http://localhost:${kubernetes_api_port} \
             --config=/etc/kubernetes/manifests \
-            --cluster-dns=10.0.0.10 \
-            --cluster-domain=cluster.local \
+            --cluster-dns=${dns_ip} \
+            --cluster-domain=${dns_domain} \
             --allow-privileged=true --v=2 \
 	    > /dev/null
 
@@ -204,6 +307,7 @@ function start_kubernetes {
     sleep 1
     create_kube_system_namespace
     activate_kubernetes_dashboard $dashboard_service_nodeport
+    activate_kubernetes_dns $dns_ip $dns_domain $dns_endpoint
     echo Kubernetes cluster is up. The Kubernetes dashboard can be accessed via HTTP at port $dashboard_service_nodeport of your Docker host.
 }
 
@@ -267,7 +371,7 @@ function stop_kubernetes {
 
 
 if [ "$1" == "up" ]; then
-    start_kubernetes $KUBERNETES_VERSION $KUBERNETES_API_PORT $KUBERNETES_DASHBOARD_NODEPORT
+    start_kubernetes $KUBERNETES_VERSION $KUBERNETES_API_PORT $KUBERNETES_DASHBOARD_NODEPORT $KUBERNETES_DNS_IP $KUBERNETES_DNS_DOMAIN $DNS_HOST_ENDPOINT
 elif [ "$1" == "down" ]; then
     # TODO: Ensure current Kubernetes context is set to local Docker (or Docker Machine VM) before downing
     stop_kubernetes $KUBERNETES_API_PORT
